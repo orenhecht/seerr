@@ -33,6 +33,7 @@ import useSWR, { mutate } from 'swr';
 
 const messages = defineMessages('components.RequestList.RequestItem', {
   seasons: '{seasonCount, plural, one {Season} other {Seasons}}',
+  episodes: '{episodeCount, plural, one {Episode} other {Episodes}}',
   failedretry: 'Something went wrong while retrying the request.',
   failedmodify: 'Something went wrong while modifying the request.',
   requested: 'Requested',
@@ -490,6 +491,24 @@ const RequestItem = ({ request, revalidateList }: RequestItemProps) => {
                           {season.seasonNumber === 0
                             ? intl.formatMessage(globalMessages.specials)
                             : season.seasonNumber}
+                        </Badge>
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {!isMovie(title) && (request.episodes ?? []).length > 0 && (
+                <div className="card-field">
+                  <span className="card-field-name">
+                    {intl.formatMessage(messages.episodes, {
+                      episodeCount: request.episodes.length,
+                    })}
+                  </span>
+                  <div className="hide-scrollbar flex flex-nowrap overflow-x-scroll">
+                    {request.episodes.map((episode) => (
+                      <span key={`episode-${episode.id}`} className="mr-2">
+                        <Badge>
+                          S{episode.seasonNumber}E{episode.episodeNumber}
                         </Badge>
                       </span>
                     ))}

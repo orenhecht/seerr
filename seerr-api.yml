@@ -1258,6 +1258,14 @@ components:
             - $ref: '#/components/schemas/User'
             - type: string
               nullable: true
+        seasons:
+          type: array
+          items:
+            $ref: '#/components/schemas/SeasonRequest'
+        episodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/EpisodeRequest'
         is4k:
           type: boolean
           example: false
@@ -1270,6 +1278,40 @@ components:
       required:
         - id
         - status
+    SeasonRequest:
+      type: object
+      properties:
+        id:
+          type: number
+          readOnly: true
+        seasonNumber:
+          type: number
+        status:
+          type: number
+        createdAt:
+          type: string
+          readOnly: true
+        updatedAt:
+          type: string
+          readOnly: true
+    EpisodeRequest:
+      type: object
+      properties:
+        id:
+          type: number
+          readOnly: true
+        seasonNumber:
+          type: number
+        episodeNumber:
+          type: number
+        status:
+          type: number
+        createdAt:
+          type: string
+          readOnly: true
+        updatedAt:
+          type: string
+          readOnly: true
     MediaInfo:
       type: object
       properties:
@@ -6386,8 +6428,25 @@ paths:
                   oneOf:
                     - type: array
                       items:
-                        type: number
-                        minimum: 0
+                        oneOf:
+                          - type: number
+                            minimum: 0
+                          - type: object
+                            properties:
+                              seasonNumber:
+                                type: number
+                                minimum: 0
+                              episodes:
+                                oneOf:
+                                  - type: array
+                                    items:
+                                      type: number
+                                      minimum: 1
+                                  - type: string
+                                    enum: [all]
+                            required:
+                              - seasonNumber
+                              - episodes
                     - type: string
                       enum: [all]
                 is4k:
@@ -6494,8 +6553,25 @@ paths:
                 seasons:
                   type: array
                   items:
-                    type: number
-                    minimum: 0
+                    oneOf:
+                      - type: number
+                        minimum: 0
+                      - type: object
+                        properties:
+                          seasonNumber:
+                            type: number
+                            minimum: 0
+                          episodes:
+                            oneOf:
+                              - type: array
+                                items:
+                                  type: number
+                                  minimum: 1
+                              - type: string
+                                enum: [all]
+                        required:
+                          - seasonNumber
+                          - episodes
                 is4k:
                   type: boolean
                   example: false

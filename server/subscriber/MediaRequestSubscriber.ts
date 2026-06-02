@@ -13,6 +13,7 @@ import {
   MediaType,
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import EpisodeRequest from '@server/entity/EpisodeRequest';
 import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
 import Season from '@server/entity/Season';
@@ -558,6 +559,22 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           return;
         }
 
+        const fullSeasonRequests = new Set(
+          entity.seasons.map((season) => season.seasonNumber)
+        );
+        const episodeRequests = (entity.episodes ?? [])
+          .filter((episode) => !fullSeasonRequests.has(episode.seasonNumber))
+          .map((episode) => ({
+            seasonNumber: episode.seasonNumber,
+            episodeNumber: episode.episodeNumber,
+          }));
+        const seasonsForSonarr = [
+          ...new Set([
+            ...entity.seasons.map((season) => season.seasonNumber),
+            ...episodeRequests.map((episode) => episode.seasonNumber),
+          ]),
+        ];
+
         const tmdb = new TheMovieDb();
         const sonarr = new SonarrAPI({
           apiKey: sonarrSettings.apiKey,
@@ -706,13 +723,14 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           rootFolderPath: rootFolder,
           title: series.name,
           tvdbid: tvdbId,
-          seasons: entity.seasons.map((season) => season.seasonNumber),
+          seasons: seasonsForSonarr,
           seasonFolder: sonarrSettings.enableSeasonFolders,
           seriesType,
           tags,
           monitored: true,
           monitorNewItems: sonarrSettings.monitorNewItems,
           searchNow: !sonarrSettings.preventSearch,
+          episodeRequests,
         };
 
         // Run entity asynchronously so we don't wait for it on the UI side
@@ -833,6 +851,7 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
 
     const statusKey = entity.is4k ? 'status4k' : 'status';
     const seasonRequestRepository = getRepository(SeasonRequest);
+    const episodeRequestRepository = getRepository(EpisodeRequest);
     const requestRepository = getRepository(MediaRequest);
 
     if (
@@ -929,9 +948,14 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
           }
         }
       }
+
+      for (const episodeRequest of entity.episodes ?? []) {
+        episodeRequest.status = MediaRequestStatus.DECLINED;
+        await episodeRequestRepository.save(episodeRequest);
+      }
     }
 
-    // Approve child seasons if parent is approved
+    // Approve child seasons and episodes if parent is approved
     if (
       media.mediaType === MediaType.TV &&
       entity.status === MediaRequestStatus.APPROVED
@@ -939,6 +963,10 @@ export class MediaRequestSubscriber implements EntitySubscriberInterface<MediaRe
       for (const season of entity.seasons) {
         season.status = MediaRequestStatus.APPROVED;
         await seasonRequestRepository.save(season);
+      }
+      for (const episode of entity.episodes ?? []) {
+        episode.status = MediaRequestStatus.APPROVED;
+        await episodeRequestRepository.save(episode);
       }
     }
   }

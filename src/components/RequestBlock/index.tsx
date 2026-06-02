@@ -26,6 +26,7 @@ import { mutate } from 'swr';
 
 const messages = defineMessages('components.RequestBlock', {
   seasons: '{seasonCount, plural, one {Season} other {Seasons}}',
+  episodes: '{episodeCount, plural, one {Episode} other {Episodes}}',
   requestoverrides: 'Request Overrides',
   server: 'Destination Server',
   profilechanged: 'Quality Profile',
@@ -277,6 +278,27 @@ const RequestBlock = ({ request, onUpdate }: RequestBlockProps) => {
                     {season.seasonNumber === 0
                       ? intl.formatMessage(globalMessages.specials)
                       : season.seasonNumber}
+                  </Badge>
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+        {(request.episodes ?? []).length > 0 && (
+          <div className="mt-2 flex flex-col text-sm">
+            <div className="mb-1 font-medium">
+              {intl.formatMessage(messages.episodes, {
+                episodeCount: request.episodes.length,
+              })}
+            </div>
+            <div>
+              {request.episodes.map((episode) => (
+                <span
+                  key={`episode-${episode.id}`}
+                  className="mb-1 mr-2 inline-block"
+                >
+                  <Badge>
+                    S{episode.seasonNumber}E{episode.episodeNumber}
                   </Badge>
                 </span>
               ))}

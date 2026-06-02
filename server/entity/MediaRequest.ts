@@ -8,7 +8,10 @@ import {
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import OverrideRule from '@server/entity/OverrideRule';
-import type { MediaRequestBody } from '@server/interfaces/api/requestInterfaces';
+import type {
+  MediaRequestBody,
+  SeasonRequestInput,
+} from '@server/interfaces/api/requestInterfaces';
 import notificationManager, { Notification } from '@server/lib/notifications';
 import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
@@ -28,6 +31,7 @@ import {
   RelationCount,
   UpdateDateColumn,
 } from 'typeorm';
+import EpisodeRequest from './EpisodeRequest';
 import Media from './Media';
 import SeasonRequest from './SeasonRequest';
 import { User } from './User';
@@ -41,6 +45,27 @@ export class BlocklistedMediaError extends Error {}
 type MediaRequestOptions = {
   isAutoRequest?: boolean;
 };
+
+const isSeasonRequestInput = (
+  season: number | SeasonRequestInput
+): season is SeasonRequestInput => typeof season === 'object';
+
+const getAutoApproveStatus = (
+  requestBody: MediaRequestBody,
+  user: User
+): MediaRequestStatus =>
+  user.hasPermission(
+    [
+      requestBody.is4k ? Permission.AUTO_APPROVE_4K : Permission.AUTO_APPROVE,
+      requestBody.is4k
+        ? Permission.AUTO_APPROVE_4K_TV
+        : Permission.AUTO_APPROVE_TV,
+      Permission.MANAGE_REQUESTS,
+    ],
+    { type: 'or' }
+  )
+    ? MediaRequestStatus.APPROVED
+    : MediaRequestStatus.PENDING;
 
 @Entity()
 export class MediaRequest {
@@ -129,7 +154,13 @@ export class MediaRequest {
         tmdbId: requestBody.mediaId,
         mediaType: requestBody.mediaType,
       },
-      relations: ['requests'],
+      relations: {
+        requests: {
+          seasons: true,
+          episodes: true,
+        },
+        seasons: true,
+      },
     });
 
     if (!media) {
@@ -393,63 +424,144 @@ export class MediaRequest {
       const tmdbMediaShow = tmdbMedia as Awaited<
         ReturnType<typeof tmdb.getTvShow>
       >;
-      let requestedSeasons =
-        requestBody.seasons === 'all'
-          ? tmdbMediaShow.seasons
-              .filter((season) => season.season_number !== 0)
-              .map((season) => season.season_number)
-          : (requestBody.seasons as number[]);
-      if (!settings.main.enableSpecialEpisodes) {
-        requestedSeasons = requestedSeasons.filter((sn) => sn > 0);
+      let requestedSeasonInputs: SeasonRequestInput[] = [];
+
+      if (requestBody.seasons === 'all') {
+        requestedSeasonInputs = tmdbMediaShow.seasons
+          .filter((season) => season.season_number !== 0)
+          .map((season) => ({
+            seasonNumber: season.season_number,
+            episodes: 'all',
+          }));
+      } else if (Array.isArray(requestBody.seasons)) {
+        requestedSeasonInputs = requestBody.seasons
+          .filter((season): season is number | SeasonRequestInput =>
+            Boolean(season)
+          )
+          .map((season) =>
+            isSeasonRequestInput(season)
+              ? season
+              : { seasonNumber: season, episodes: 'all' }
+          );
       }
 
-      let existingSeasons: number[] = [];
+      if (!settings.main.enableSpecialEpisodes) {
+        requestedSeasonInputs = requestedSeasonInputs.filter(
+          (season) => season.seasonNumber > 0
+        );
+      }
+
+      const requestedFullSeasons = new Set<number>();
+      const requestedEpisodes = new Map<number, Set<number>>();
+
+      requestedSeasonInputs.forEach((seasonInput) => {
+        if (seasonInput.episodes === 'all') {
+          requestedFullSeasons.add(seasonInput.seasonNumber);
+          requestedEpisodes.delete(seasonInput.seasonNumber);
+          return;
+        }
+
+        if (!requestedFullSeasons.has(seasonInput.seasonNumber)) {
+          const episodeSet =
+            requestedEpisodes.get(seasonInput.seasonNumber) ?? new Set();
+
+          seasonInput.episodes.forEach((episodeNumber) => {
+            if (Number.isInteger(episodeNumber) && episodeNumber > 0) {
+              episodeSet.add(episodeNumber);
+            }
+          });
+
+          if (episodeSet.size > 0) {
+            requestedEpisodes.set(seasonInput.seasonNumber, episodeSet);
+          }
+        }
+      });
+
+      const existingSeasons = new Set<number>();
+      const existingEpisodes = new Set<string>();
 
       // We need to check existing requests on this title to make sure we don't double up on seasons that were
       // already requested. In the case they were, we just throw out any duplicates but still approve the request.
       // (Unless there are no seasons, in which case we abort)
       if (media.requests) {
-        existingSeasons = media.requests
+        media.requests
           .filter(
             (request) =>
               request.is4k === requestBody.is4k &&
               request.status !== MediaRequestStatus.DECLINED &&
               request.status !== MediaRequestStatus.COMPLETED
           )
-          .reduce((seasons, request) => {
-            const combinedSeasons = request.seasons.map(
-              (season) => season.seasonNumber
+          .forEach((request) => {
+            request.seasons.forEach((season) =>
+              existingSeasons.add(season.seasonNumber)
             );
-
-            return [...seasons, ...combinedSeasons];
-          }, [] as number[]);
+            request.episodes?.forEach((episode) =>
+              existingEpisodes.add(
+                `${episode.seasonNumber}:${episode.episodeNumber}`
+              )
+            );
+          });
       }
 
       // We should also check seasons that are available/partially available but don't have existing requests
       if (media.seasons) {
-        existingSeasons = [
-          ...existingSeasons,
-          ...media.seasons
-            .filter(
-              (season) =>
-                season[requestBody.is4k ? 'status4k' : 'status'] !==
-                  MediaStatus.UNKNOWN &&
-                season[requestBody.is4k ? 'status4k' : 'status'] !==
-                  MediaStatus.DELETED
-            )
-            .map((season) => season.seasonNumber),
-        ];
+        media.seasons
+          .filter(
+            (season) =>
+              season[requestBody.is4k ? 'status4k' : 'status'] ===
+              MediaStatus.AVAILABLE
+          )
+          .forEach((season) => existingSeasons.add(season.seasonNumber));
       }
 
-      const finalSeasons = requestedSeasons.filter(
-        (rs) => !existingSeasons.includes(rs)
+      const childStatus = getAutoApproveStatus(requestBody, user);
+      const finalSeasonRequests = [...requestedFullSeasons]
+        .filter((seasonNumber) => !existingSeasons.has(seasonNumber))
+        .map(
+          (seasonNumber) =>
+            new SeasonRequest({
+              seasonNumber,
+              status: childStatus,
+            })
+        );
+
+      const finalEpisodeRequests = [...requestedEpisodes.entries()].flatMap(
+        ([seasonNumber, episodeNumbers]) => {
+          if (existingSeasons.has(seasonNumber)) {
+            return [];
+          }
+
+          return [...episodeNumbers]
+            .filter(
+              (episodeNumber) =>
+                !existingEpisodes.has(`${seasonNumber}:${episodeNumber}`)
+            )
+            .map(
+              (episodeNumber) =>
+                new EpisodeRequest({
+                  seasonNumber,
+                  episodeNumber,
+                  status: childStatus,
+                })
+            );
+        }
       );
 
-      if (finalSeasons.length === 0) {
-        throw new NoSeasonsAvailableError('No seasons available to request');
+      const quotaSeasonCount = new Set([
+        ...finalSeasonRequests.map((season) => season.seasonNumber),
+        ...finalEpisodeRequests.map((episode) => episode.seasonNumber),
+      ]).size;
+
+      if (
+        finalSeasonRequests.length === 0 &&
+        finalEpisodeRequests.length === 0
+      ) {
+        throw new NoSeasonsAvailableError(
+          'No seasons or episodes available to request'
+        );
       } else if (
         quotas.tv.limit &&
-        finalSeasons.length > (quotas.tv.remaining ?? 0)
+        quotaSeasonCount > (quotas.tv.remaining ?? 0)
       ) {
         throw new QuotaRestrictedError('Series Quota exceeded.');
       }
@@ -495,26 +607,8 @@ export class MediaRequest {
         rootFolder: rootFolder,
         languageProfileId: requestBody.languageProfileId,
         tags: tags,
-        seasons: finalSeasons.map(
-          (sn) =>
-            new SeasonRequest({
-              seasonNumber: sn,
-              status: user.hasPermission(
-                [
-                  requestBody.is4k
-                    ? Permission.AUTO_APPROVE_4K
-                    : Permission.AUTO_APPROVE,
-                  requestBody.is4k
-                    ? Permission.AUTO_APPROVE_4K_TV
-                    : Permission.AUTO_APPROVE_TV,
-                  Permission.MANAGE_REQUESTS,
-                ],
-                { type: 'or' }
-              )
-                ? MediaRequestStatus.APPROVED
-                : MediaRequestStatus.PENDING,
-            })
-        ),
+        seasons: finalSeasonRequests,
+        episodes: finalEpisodeRequests,
         isAutoRequest: options.isAutoRequest ?? false,
       });
 
@@ -572,6 +666,15 @@ export class MediaRequest {
     cascade: true,
   })
   public seasons: SeasonRequest[];
+
+  @RelationCount((request: MediaRequest) => request.episodes)
+  public episodeCount: number;
+
+  @OneToMany(() => EpisodeRequest, (episode) => episode.request, {
+    eager: true,
+    cascade: true,
+  })
+  public episodes: EpisodeRequest[];
 
   @Column({ default: false })
   public is4k: boolean;
@@ -731,6 +834,14 @@ export class MediaRequest {
     if (Array.isArray(this.seasons)) {
       this.seasons.sort((a, b) => a.id - b.id);
     }
+    if (Array.isArray(this.episodes)) {
+      this.episodes.sort(
+        (a, b) =>
+          a.seasonNumber - b.seasonNumber ||
+          a.episodeNumber - b.episodeNumber ||
+          a.id - b.id
+      );
+    }
   }
 
   static async sendNotification(
@@ -819,9 +930,24 @@ export class MediaRequest {
           extra: [
             {
               name: 'Requested Seasons',
-              value: entity.seasons
-                .map((season) => season.seasonNumber)
-                .join(', '),
+              value: [
+                ...entity.seasons.map((season) => `${season.seasonNumber}`),
+                ...Object.entries(
+                  (entity.episodes ?? []).reduce(
+                    (seasons, episode) => {
+                      seasons[episode.seasonNumber] = [
+                        ...(seasons[episode.seasonNumber] ?? []),
+                        episode.episodeNumber,
+                      ];
+                      return seasons;
+                    },
+                    {} as Record<number, number[]>
+                  )
+                ).map(
+                  ([seasonNumber, episodes]) =>
+                    `${seasonNumber} (E${episodes.sort((a, b) => a - b).join(', E')})`
+                ),
+              ].join(', '),
             },
           ],
         });

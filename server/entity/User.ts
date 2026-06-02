@@ -25,6 +25,7 @@ import {
   RelationCount,
   UpdateDateColumn,
 } from 'typeorm';
+import EpisodeRequest from './EpisodeRequest';
 import Issue from './Issue';
 import { MediaRequest } from './MediaRequest';
 import SeasonRequest from './SeasonRequest';
@@ -343,8 +344,19 @@ export class User {
                 .leftJoin('season.request', 'parentRequest')
                 .where('parentRequest.id = request.id');
             }, 'seasonCount')
+            .addSelect((subQuery) => {
+              return subQuery
+                .select('COUNT(DISTINCT episode.seasonNumber)', 'episodeCount')
+                .from(EpisodeRequest, 'episode')
+                .leftJoin('episode.request', 'parentRequest')
+                .where('parentRequest.id = request.id');
+            }, 'episodeCount')
             .getMany()
-        ).reduce((sum: number, req: MediaRequest) => sum + req.seasonCount, 0)
+        ).reduce(
+          (sum: number, req: MediaRequest) =>
+            sum + (req.seasonCount ?? 0) + (req.episodeCount ?? 0),
+          0
+        )
       : 0;
 
     return {

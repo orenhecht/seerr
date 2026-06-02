@@ -6,6 +6,7 @@ import {
   MediaType,
 } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
+import EpisodeRequest from '@server/entity/EpisodeRequest';
 import Media from '@server/entity/Media';
 import {
   BlocklistedMediaError,
@@ -20,6 +21,7 @@ import { User } from '@server/entity/User';
 import type {
   MediaRequestBody,
   RequestResultsResponse,
+  SeasonRequestInput,
 } from '@server/interfaces/api/requestInterfaces';
 import { Permission } from '@server/lib/permissions';
 import { getSettings } from '@server/lib/settings';
@@ -28,6 +30,26 @@ import { isAuthenticated } from '@server/middleware/auth';
 import { Router } from 'express';
 
 const requestRoutes = Router();
+
+const isSeasonRequestInput = (
+  season: number | SeasonRequestInput
+): season is SeasonRequestInput => typeof season === 'object';
+
+const normalizeSeasonInputs = (
+  seasons: (number | SeasonRequestInput)[] | 'all' | undefined
+): SeasonRequestInput[] => {
+  if (!seasons || seasons === 'all') {
+    return [];
+  }
+
+  return seasons
+    .filter((season): season is number | SeasonRequestInput => Boolean(season))
+    .map((season) =>
+      isSeasonRequestInput(season)
+        ? season
+        : { seasonNumber: season, episodes: 'all' }
+    );
+};
 
 requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
   '/',
@@ -126,6 +148,7 @@ requestRoutes.get<Record<string, unknown>, RequestResultsResponse>(
         .createQueryBuilder('request')
         .leftJoinAndSelect('request.media', 'media')
         .leftJoinAndSelect('request.seasons', 'seasons')
+        .leftJoinAndSelect('request.episodes', 'episodes')
         .leftJoinAndSelect('request.modifiedBy', 'modifiedBy')
         .leftJoinAndSelect('request.requestedBy', 'requestedBy')
         .where('request.status IN (:...requestStatus)', {
@@ -431,7 +454,7 @@ requestRoutes.get('/:requestId', async (req, res, next) => {
   try {
     const request = await requestRepository.findOneOrFail({
       where: { id: Number(req.params.requestId) },
-      relations: { requestedBy: true, modifiedBy: true },
+      relations: { requestedBy: true, modifiedBy: true, episodes: true },
     });
 
     if (
@@ -467,6 +490,7 @@ requestRoutes.put<{ requestId: string }>(
         where: {
           id: Number(req.params.requestId),
         },
+        relations: { episodes: true },
       });
 
       if (!request) {
@@ -522,9 +546,9 @@ requestRoutes.put<{ requestId: string }>(
         request.tags = req.body.tags;
         request.requestedBy = requestUser as User;
 
-        const requestedSeasons = req.body.seasons as number[] | undefined;
+        const requestedSeasonInputs = normalizeSeasonInputs(req.body.seasons);
 
-        if (!requestedSeasons || requestedSeasons.length === 0) {
+        if (requestedSeasonInputs.length === 0) {
           throw new Error(
             'Missing seasons. If you want to cancel a series request, use the DELETE method.'
           );
@@ -533,11 +557,19 @@ requestRoutes.put<{ requestId: string }>(
         // Get existing media so we can work with all the requests
         const media = await mediaRepository.findOneOrFail({
           where: { tmdbId: request.media.tmdbId, mediaType: MediaType.TV },
-          relations: { requests: true },
+          relations: {
+            requests: {
+              seasons: true,
+              episodes: true,
+            },
+          },
         });
 
         // Get all requested seasons that are not part of this request we are editing
-        const existingSeasons = media.requests
+        const existingSeasons = new Set<number>();
+        const existingEpisodes = new Set<string>();
+
+        media.requests
           .filter(
             (r) =>
               r.is4k === request.is4k &&
@@ -545,31 +577,83 @@ requestRoutes.put<{ requestId: string }>(
               r.status !== MediaRequestStatus.DECLINED &&
               r.status !== MediaRequestStatus.COMPLETED
           )
-          .reduce((seasons, r) => {
-            const combinedSeasons = r.seasons.map(
-              (season) => season.seasonNumber
+          .forEach((r) => {
+            r.seasons.forEach((season) =>
+              existingSeasons.add(season.seasonNumber)
             );
+            r.episodes?.forEach((episode) =>
+              existingEpisodes.add(
+                `${episode.seasonNumber}:${episode.episodeNumber}`
+              )
+            );
+          });
 
-            return [...seasons, ...combinedSeasons];
-          }, [] as number[]);
+        const requestedFullSeasons = new Set<number>();
+        const requestedEpisodes = new Map<number, Set<number>>();
 
-        const filteredSeasons = requestedSeasons.filter(
-          (rs) => !existingSeasons.includes(rs)
+        requestedSeasonInputs.forEach((seasonInput) => {
+          if (seasonInput.episodes === 'all') {
+            requestedFullSeasons.add(seasonInput.seasonNumber);
+            requestedEpisodes.delete(seasonInput.seasonNumber);
+            return;
+          }
+
+          if (!requestedFullSeasons.has(seasonInput.seasonNumber)) {
+            requestedEpisodes.set(
+              seasonInput.seasonNumber,
+              new Set(
+                seasonInput.episodes.filter(
+                  (episodeNumber) =>
+                    Number.isInteger(episodeNumber) && episodeNumber > 0
+                )
+              )
+            );
+          }
+        });
+
+        const filteredSeasonNumbers = [...requestedFullSeasons].filter(
+          (seasonNumber) => !existingSeasons.has(seasonNumber)
         );
 
-        if (filteredSeasons.length === 0) {
+        const filteredEpisodes = [...requestedEpisodes.entries()].flatMap(
+          ([seasonNumber, episodeNumbers]) => {
+            if (existingSeasons.has(seasonNumber)) {
+              return [];
+            }
+
+            return [...episodeNumbers]
+              .filter(
+                (episodeNumber) =>
+                  !existingEpisodes.has(`${seasonNumber}:${episodeNumber}`)
+              )
+              .map((episodeNumber) => ({ seasonNumber, episodeNumber }));
+          }
+        );
+
+        if (
+          filteredSeasonNumbers.length === 0 &&
+          filteredEpisodes.length === 0
+        ) {
           return next({
             status: 202,
-            message: 'No seasons available to request',
+            message: 'No seasons or episodes available to request',
           });
         }
 
-        const newSeasons = requestedSeasons.filter(
+        const newSeasons = filteredSeasonNumbers.filter(
           (sn) => !request.seasons.map((s) => s.seasonNumber).includes(sn)
         );
 
         request.seasons = request.seasons.filter((rs) =>
-          filteredSeasons.includes(rs.seasonNumber)
+          filteredSeasonNumbers.includes(rs.seasonNumber)
+        );
+
+        request.episodes = (request.episodes ?? []).filter((episode) =>
+          filteredEpisodes.some(
+            (filteredEpisode) =>
+              filteredEpisode.seasonNumber === episode.seasonNumber &&
+              filteredEpisode.episodeNumber === episode.episodeNumber
+          )
         );
 
         if (newSeasons.length > 0) {
@@ -582,6 +666,32 @@ requestRoutes.put<{ requestId: string }>(
               (ns) =>
                 new SeasonRequest({
                   seasonNumber: ns,
+                  status: MediaRequestStatus.PENDING,
+                })
+            )
+          );
+        }
+
+        const newEpisodes = filteredEpisodes.filter(
+          (episode) =>
+            !request.episodes.some(
+              (existingEpisode) =>
+                existingEpisode.seasonNumber === episode.seasonNumber &&
+                existingEpisode.episodeNumber === episode.episodeNumber
+            )
+        );
+
+        if (newEpisodes.length > 0) {
+          logger.debug('Adding new episodes to request', {
+            label: 'Media Request',
+            newEpisodes,
+          });
+          request.episodes.push(
+            ...newEpisodes.map(
+              (episode) =>
+                new EpisodeRequest({
+                  seasonNumber: episode.seasonNumber,
+                  episodeNumber: episode.episodeNumber,
                   status: MediaRequestStatus.PENDING,
                 })
             )
@@ -604,7 +714,7 @@ requestRoutes.delete('/:requestId', async (req, res, next) => {
   try {
     const request = await requestRepository.findOneOrFail({
       where: { id: Number(req.params.requestId) },
-      relations: { requestedBy: true, modifiedBy: true },
+      relations: { requestedBy: true, modifiedBy: true, episodes: true },
     });
 
     if (
@@ -641,7 +751,7 @@ requestRoutes.post<{
     try {
       const request = await requestRepository.findOneOrFail({
         where: { id: Number(req.params.requestId) },
-        relations: { requestedBy: true, modifiedBy: true },
+        relations: { requestedBy: true, modifiedBy: true, episodes: true },
       });
 
       // this also triggers updating the parent media's status & sending to *arr
@@ -672,7 +782,7 @@ requestRoutes.post<{
     try {
       const request = await requestRepository.findOneOrFail({
         where: { id: Number(req.params.requestId) },
-        relations: { requestedBy: true, modifiedBy: true },
+        relations: { requestedBy: true, modifiedBy: true, episodes: true },
       });
 
       let newStatus: MediaRequestStatus;
